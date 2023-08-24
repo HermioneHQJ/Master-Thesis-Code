@@ -1,0 +1,244 @@
+import torch
+import torchvision
+import requests
+import gc
+from torchvision.models.detection import FasterRCNN
+from torchvision.transforms import functional as F
+from transformers import YolosFeatureExtractor, YolosForObjectDetection, AutoImageProcessor
+from PIL import Image
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from transformers import pipeline
+import os
+import tqdm
+import pandas as pd
+from transformers import AutoImageProcessor, ResNetForImageClassification
+import socket
+import time
+
+# Read the CSV file with image URLs
+csv_file = "C:/Users/luigi/OneDrive - University of Glasgow/Desktop/Preliminary Script/twiit&URL for colab_14_07_2023.csv"
+df = pd.read_csv(csv_file)
+
+# Create a list to store the results
+results = []
+long_format_results = []
+
+# Load the pre-trained Faster R-CNN model
+model_rcnn = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
+model_rcnn.eval()
+
+# Get the COCO label names
+COCO_INSTANCE_CATEGORY_NAMES = [
+    '__background__', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
+    'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'N/A', 'stop sign',
+    'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+    'elephant', 'bear', 'zebra', 'giraffe', 'N/A', 'backpack', 'umbrella', 'N/A', 'N/A',
+    'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
+    'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+    'bottle', 'N/A', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl',
+    'banana', 'apple', 'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza',
+    'donut', 'cake', 'chair', 'couch', 'potted plant', 'bed', 'N/A', 'dining table',
+    'N/A', 'N/A', 'toilet', 'N/A', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
+    'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'N/A', 'book',
+    'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+]
+
+# Load the YOLOS model for object detection
+feature_extractor_yolos = YolosFeatureExtractor.from_pretrained('hustvl/yolos-base')
+model_yolos = YolosForObjectDetection.from_pretrained('hustvl/yolos-base')
+image_processor_yolos = AutoImageProcessor.from_pretrained("hustvl/yolos-base")
+
+# Load the BLIP model for image captioning
+processor_blip = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+model_blip = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+
+# Load the image-to-text model
+image_to_text = pipeline("image-to-text", model="nlpconnect/vit-gpt2-image-captioning")
+
+# Load the ResNet-50 model for image classification
+classification_processor = AutoImageProcessor.from_pretrained("microsoft/resnet-50")
+classification_model = ResNetForImageClassification.from_pretrained("microsoft/resnet-50")
+
+# Process each image URL
+batch_size = 100  # Set the batch size to 10 images
+results = []
+
+# Check if there is a saved batch index
+if os.path.exists("batch_index.txt"):
+    with open("batch_index.txt", "r") as file:
+        batch_index = int(file.read())
+else:
+    batch_index = 0
+
+for i in range(batch_index, len(df), batch_size):
+    batch_urls = df["x"][i:i+batch_size]
+
+    for image_url in tqdm.tqdm(batch_urls):
+        # Check internet connection (optional)
+        try:
+            socket.create_connection(("8.8.8.8", 53), timeout=5)
+        except OSError:
+            print("Lost internet connection. Waiting for 10 minutes...")
+            time.sleep(600)  # Wait for 10 minutes (600 seconds)
+            continue  # Continue to the next iteration of the loop
+
+        try:
+            # Download and open the image
+            response = requests.get(image_url, stream=True)
+            response.raise_for_status()
+            image = Image.open(response.raw)
+
+            # Convert image to tensor
+            image_tensor = F.to_tensor(image)
+
+            # Perform object detection using Faster R-CNN
+            with torch.no_grad():
+                predictions = model_rcnn([image_tensor])
+            labels = predictions[0]['labels'].tolist()
+            boxes = predictions[0]['boxes'].tolist()
+            scores = predictions[0]['scores'].tolist()
+
+            # Retrieve label names for Faster R-CNN
+            filtered_labels = [COCO_INSTANCE_CATEGORY_NAMES[label] for label in labels]
+
+            # Perform object detection using YOLOS
+            inputs_yolos = feature_extractor_yolos(images=image, return_tensors="pt")
+            outputs_yolos = model_yolos(**inputs_yolos)
+            del inputs_yolos
+            target_sizes = torch.tensor([image.size[::-1]])
+            yolos_results = image_processor_yolos.post_process(outputs_yolos, target_sizes=target_sizes)[0]
+            yolos_labels = [model_yolos.config.id2label[label.item()] for label in yolos_results["labels"]]
+            yolos_scores = yolos_results["scores"].tolist()
+            yolos_boxes = yolos_results["boxes"].tolist()
+
+            # Perform image captioning using BLIP
+            raw_image = Image.open(requests.get(image_url, stream=True).raw).convert('RGB')
+            inputs_blip = processor_blip(raw_image, return_tensors="pt")
+            outputs_blip = model_blip.generate(**inputs_blip)
+            caption_blip = processor_blip.decode(outputs_blip[0], skip_special_tokens=True)
+
+            # Perform image-to-text using the Vit-GPT2 model
+            text = image_to_text(image)[0]['generated_text']
+
+            # Image classification with ResNet-50
+            inputs_classification = classification_processor(image, return_tensors="pt")
+            outputs_classification = classification_model(**inputs_classification)
+            predicted_label_idx = outputs_classification.logits.argmax(dim=1).item()
+            predicted_scores = outputs_classification.logits.softmax(dim=1)[0].tolist()
+
+            logits = outputs_classification.logits
+        
+            predicted_label = logits.argmax(-1).item()
+
+            # Store the results
+            results.append({
+                "Image_URL": image_url,
+                "FasterRCNN_Labels": filtered_labels,
+                "FasterRCNN_Boxes": boxes,
+                "FasterRCNN_Scores": scores,
+                "YOLOS_Labels": yolos_labels,
+                "YOLOS_Boxes": yolos_boxes,
+                "YOLOS_Scores": yolos_scores,
+                "Caption_blip": caption_blip,
+                "Text_gpt2": text,
+                "ResNet50_Label": classification_model.config.id2label[predicted_label],
+                "ResNet50_Scores": predicted_scores[predicted_label]
+            })
+
+            # Append the Faster R-CNN results to the long format
+            for label, box, score in zip(filtered_labels, boxes, scores):
+                long_format_results.append({
+                    "image_path": image_url,
+                    "label": label,
+                    "box": box,
+                    "score": score,
+                    "method": "FasterRCNN"
+                })
+
+            # Append the YOLOS results to the long format
+            for label, box, score in zip(yolos_labels, yolos_boxes, yolos_scores):
+                long_format_results.append({
+                    "image_path": image_url,
+                    "label": label,
+                    "box": box,
+                    "score": score,
+                    "method": "YOLOS"
+                })
+
+            # Append the caption and text results to the long format
+            long_format_results.append({
+                "image_path": image_url,
+                "label": None,
+                "box": None,
+                "score": None,
+                "method": "Caption_blip",
+                "text": caption_blip
+            })
+
+            long_format_results.append({
+                "image_path": image_url,
+                "label": None,
+                "box": None,
+                "score": None,
+                "method": "Text_gpt2",
+                "text": text
+            })
+
+            # Append the ResNet-50 classification results to the long format
+            resnet = {
+                "image_path": image_url,
+                "label": classification_model.config.id2label[predicted_label],
+                "score": predicted_scores[predicted_label],
+                "method": "ResNet50"
+            }
+            long_format_results.append(resnet)
+            print(resnet)
+
+            # Free up memory
+            del image, image_tensor, predictions, filtered_labels, boxes, scores
+            del outputs_yolos, target_sizes, yolos_results, yolos_labels, yolos_scores, yolos_boxes
+            del raw_image, inputs_blip, outputs_blip, caption_blip, text
+            gc.collect()
+
+        except Exception as e:
+            print(f"Error processing image {image_url}: {str(e)}")
+            continue  # Skip the current URL if there's an error
+
+    # Save the batch results after processing the batch
+    # Convert the results to a DataFrame
+    results_df = pd.DataFrame(results)
+
+    # Save the results to a CSV file
+    results_df.to_csv(f"object_detection_results_{i+batch_size}.csv", index=False)
+    # Convert the long format results to a DataFrame
+    long_format_results_df = pd.DataFrame(long_format_results)
+
+    # Save the long format results to a CSV file with a unique filename
+    # indicating the number of images processed so far
+    long_format_results_df.to_csv(f"long_format_results_{i+batch_size}.csv", index=False)
+
+    # Update the batch index
+    batch_index = i + batch_size
+    with open("batch_index.txt", "w") as file:
+        file.write(str(batch_index))
+
+    # Clear the lists for the next batch
+    results.clear()
+    long_format_results.clear()
+
+    # Free up memory
+    del results_df, long_format_results_df
+    gc.collect()
+
+
+# Convert the results to a DataFrame
+results_df = pd.DataFrame(results)
+
+# Save the results to a CSV file
+#results_df.to_csv("/content/drive/MyDrive/Colab Notebooks/object_detection_results.csv", index=False)
+
+# Convert the long format results to a DataFrame
+long_format_results_df = pd.DataFrame(long_format_results)
+
+# Save the long format results to a CSV file
+long_format_results_df.to_csv("C:/Users/luigi/OneDrive - University of Glasgow/Desktop/Preliminary Script/TW_object_detection_results_long_format_01_08_2023.csv", index=False)
